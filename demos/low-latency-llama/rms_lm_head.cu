@@ -11,7 +11,10 @@ template <typename Config, typename Globals> struct rms_lm_head {
     static constexpr int opcode =
         OPCODE_RMS_LM_Head; // Op index within the layer -- controls which
                             // barrier to listen to.
-    static constexpr int EXPECTED_ARRIVAL_COUNT = 512;
+    // prev op = down_proj: (intermediate/hidden) reduction cols * (hidden/block) blocks.
+    static constexpr int EXPECTED_ARRIVAL_COUNT =
+        (Globals::intermediate_dim / Globals::hidden_dim) *
+        (Globals::hidden_dim / Globals::matvec_block_size);
 
     struct parsed_instruction {
         int start_block_idx, end_block_idx, iters;

@@ -26,7 +26,10 @@ rms_norm(const sv_t &rms_scale_smem, const sv_t &activations_smem,
         full_sum += smem_rms_partial_sums[i];
     }
 
-    float variance = full_sum / 2048.0f;
+    // RMS over the full hidden_dim: each of NUM_CONSUMER_WARPS warps summed a
+    // sv_t::length slice (hidden_dim / NUM_CONSUMER_WARPS).
+    float variance =
+        full_sum / float(sv_t::length * Config::NUM_CONSUMER_WARPS);
     float rms_scale = rsqrtf(variance + rms_norm_eps);
 
     kittens::warp::mul(activations_vec, activations_vec, rms_scale);

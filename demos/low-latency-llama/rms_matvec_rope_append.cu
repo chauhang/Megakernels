@@ -12,9 +12,18 @@ template <typename Config, typename Globals> struct rms_qkv_rope_append {
         OPCODE_RMS_QKV_MatVecRopeAppend; // Op index within the layer --
                                          // controls which barrier to listen to.
 
-    static constexpr int K_BLK_START = 2048 / Globals::matvec_block_size;
-    static constexpr int V_BLK_START = 2560 / Globals::matvec_block_size;
-    static constexpr int EXPECTED_ARRIVAL_COUNT = 512;
+    // Q occupies [0, K_BLK_START), K [K_BLK_START, V_BLK_START), then V.
+    static constexpr int K_BLK_START =
+        Globals::num_attention_heads * Globals::head_dim / Globals::matvec_block_size;
+    static constexpr int V_BLK_START =
+        (Globals::num_attention_heads + Globals::num_kv_heads) * Globals::head_dim /
+        Globals::matvec_block_size;
+    // prev op = down_proj: (intermediate/hidden) reduction cols * (hidden/block) blocks.
+    static constexpr int EXPECTED_ARRIVAL_COUNT =
+        (Globals::intermediate_dim / Globals::hidden_dim) *
+        (Globals::hidden_dim / Globals::matvec_block_size);
+    // 16-element blocks per attention head (4 for Llama head_dim 64, 8 for Qwen3 128).
+    static constexpr int BLOCKS_PER_HEAD = Globals::head_dim / Globals::matvec_block_size;
 
     using rope_t = kittens::sv_fl<Globals::head_dim>;
 
@@ -93,7 +102,7 @@ template <typename Config, typename Globals> struct rms_qkv_rope_append {
 
             kittens::wait(rope_arrived(s), 0);
 
-            auto head_chunk = block_idx % 4;
+            auto head_chunk = block_idx % BLOCKS_PER_HEAD;
 
             kittens::sv_fl<16> &rope_cos_sv = *reinterpret_cast<kittens::sv_fl<16> *>(
                 get_rope_cos_ptr(s) + head_chunk * 64);
@@ -158,8 +167,9 @@ template <typename Config, typename Globals> struct rms_qkv_rope_append {
                 // asm volatile("fence.acq_rel.gpu;\n"); // possible we need sc
                 // here but I don't think so.
 
-                atomicAdd(&g.Bar[{inst.layer_idx, opcode - 1, block_idx / 4}],
-                          1);
+                atomicAdd(
+                    &g.Bar[{inst.layer_idx, opcode - 1, block_idx / BLOCKS_PER_HEAD}],
+                    1);
                 s.record(megakernel::TEVENT_DONE_GMEM_STORE);
             }
 
