@@ -432,9 +432,11 @@ class LlamaEmbeddings(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
 
     def forward(self, batch_state: BatchState):
-        hidden_states = self.embed_tokens(batch_state.input_ids)
-
-        batch_state.hidden_states = hidden_states
+        # Allow pre-computed input embeddings (e.g. multimodal: audio embeddings
+        # spliced into the text sequence for Ultravox). Only embed token ids when
+        # embeddings weren't supplied.
+        if batch_state.hidden_states is None:
+            batch_state.hidden_states = self.embed_tokens(batch_state.input_ids)
         return batch_state
 
 
