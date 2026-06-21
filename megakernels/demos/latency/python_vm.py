@@ -95,7 +95,9 @@ def o_proj_residual(globals: Globals, instruction: O_ProjResidual):
         block_size=globals.o_proj_block_size,
         start_block_idx=instruction.start_block_idx,
         end_block_idx=instruction.end_block_idx,
-        reduction_size=globals.matvec_reduction_size,
+        # o_proj reduces the full attention width (num_heads*head_dim) in one
+        # block; this equals hidden_size for Llama but is larger for Qwen3.
+        reduction_size=globals.num_attention_heads * globals.head_dim,
         reduction_block_idx=instruction.reduction_block_idx,
     )
 
@@ -107,7 +109,8 @@ def o_proj_residual(globals: Globals, instruction: O_ProjResidual):
 def down_proj_residual(globals: Globals, instruction: DownProjResidual):
     # Barrier check
     op_barriers = globals.barriers[instruction.layer_idx, instruction.prev_opcode() - 1]
-    assert op_barriers[0] == 512  # 8192 / 16
+    # silu produced intermediate_size/up_gate_block_size blocks
+    assert op_barriers[0] == globals.intermediate_size // globals.up_gate_proj_block_size
 
     matvec_with_residual(
         mat=globals.down_proj_weights[instruction.layer_idx],
@@ -129,7 +132,8 @@ def layer_norm_double_matvec_silu(
 ):
     # Barrier check
     op_barriers = globals.barriers[instruction.layer_idx, instruction.prev_opcode() - 1]
-    assert op_barriers[0] == 128
+    # o_proj produced hidden_size/o_proj_block_size blocks
+    assert op_barriers[0] == globals.hidden_size // globals.o_proj_block_size
 
     post_ln = rms_norm(
         inp=globals.hidden_states,
@@ -173,7 +177,12 @@ def layer_norm_matvec_rope_append(
     # Barrier check
     if layer_idx > 0:
         op_barriers = globals.barriers[layer_idx - 1, instruction.prev_opcode() - 1]
-        assert op_barriers[0] == 512
+        # down_proj produced (hidden/down_block) blocks over (intermediate/hidden)
+        # reduction columns
+        down_col_splits = globals.intermediate_size // globals.hidden_size
+        assert op_barriers[0] == down_col_splits * (
+            globals.hidden_size // globals.down_proj_block_size
+        )
 
     post_ln = rms_norm(
         inp=globals.hidden_states,
@@ -209,17 +218,37 @@ def layer_norm_matvec_rope_append(
         out = matmul_output
 
         if mode in ["q", "k"]:
-            full_head = torch.zeros(
-                1,
-                globals.head_dim,
-                device=globals.hidden_states.device,
-                dtype=out.dtype,
-            )
             head_segment = start % globals.head_dim
             full_head_start = head_segment
             full_head_end = full_head_start + (end - start)
 
-            full_head[:, full_head_start:full_head_end] = out
+            if globals.q_norm_weights is not None:
+                # Qwen3 QK-norm: the RMS is over the whole head_dim, so recompute
+                # the full head's projection here (cheap for a reference VM),
+                # normalize it, then RoPE the whole head and slice this block.
+                head_base = (start // globals.head_dim) * globals.head_dim
+                full_head = einsum(
+                    globals.qkv_proj_weights[layer_idx][
+                        head_base : head_base + globals.head_dim
+                    ],
+                    post_ln,
+                    "o i, i -> o",
+                ).unsqueeze(0)
+                norm_weight = (
+                    globals.q_norm_weights
+                    if mode == "q"
+                    else globals.k_norm_weights
+                )[layer_idx]
+                full_head = rms_norm(full_head, norm_weight, globals.rms_norm_eps)
+            else:
+                full_head = torch.zeros(
+                    1,
+                    globals.head_dim,
+                    device=globals.hidden_states.device,
+                    dtype=out.dtype,
+                )
+                full_head[:, full_head_start:full_head_end] = out
+
             full_head_with_rope, _ = apply_rotary_pos_emb_interleaved(
                 q=full_head,
                 k=full_head,
@@ -245,14 +274,20 @@ def layer_norm_matvec_rope_append(
                     out
                 )
 
-        barriers[block_idx // 4] += 1
+        # Barrier is per-head; blocks_per_head = head_dim // qkv_block_size
+        # (4 for Llama's head_dim 64, 8 for Qwen3's 128).
+        blocks_per_head = globals.head_dim // globals.qkv_block_size
+        barriers[block_idx // blocks_per_head] += 1
 
 
 def rms_lm_head(globals: Globals, instruction: RMS_LM_Head):
     op_barriers = globals.barriers[
         globals.num_hidden_layers - 1, instruction.prev_opcode() - 1
     ]
-    assert op_barriers[0] == 512
+    down_col_splits = globals.intermediate_size // globals.hidden_size
+    assert op_barriers[0] == down_col_splits * (
+        globals.hidden_size // globals.down_proj_block_size
+    )
 
     post_ln = rms_norm(
         inp=globals.hidden_states,
@@ -277,16 +312,21 @@ def rms_lm_head(globals: Globals, instruction: RMS_LM_Head):
 def partial_attention(globals: Globals, instruction: PartialAttention):
     gqa_ratio = globals.num_attention_heads // globals.num_kv_heads
 
-    # Barrier check
+    # Barrier check. Each q/k/v head received blocks_per_head increments from the
+    # QKV op (head_dim // qkv_block_size: 4 for Llama, 8 for Qwen3).
+    blocks_per_head = globals.head_dim // globals.qkv_block_size
     op_barriers = globals.barriers[instruction.layer_idx, instruction.prev_opcode() - 1]
     for i in range(gqa_ratio):
-        assert op_barriers[instruction.kv_head_idx * gqa_ratio + i] == 4
-    assert op_barriers[globals.num_attention_heads + instruction.kv_head_idx] == 4
+        assert op_barriers[instruction.kv_head_idx * gqa_ratio + i] == blocks_per_head
+    assert (
+        op_barriers[globals.num_attention_heads + instruction.kv_head_idx]
+        == blocks_per_head
+    )
     assert (
         op_barriers[
             globals.num_attention_heads + globals.num_kv_heads + instruction.kv_head_idx
         ]
-        == 4
+        == blocks_per_head
     )
 
     kv_block_size = globals.attn_kv_block_size

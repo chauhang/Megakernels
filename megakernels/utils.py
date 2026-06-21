@@ -107,3 +107,23 @@ def trepr(t: Tensor):
 def get_sm_count(device: str) -> int:
     device_props = torch.cuda.get_device_properties(device)
     return device_props.multi_processor_count
+
+
+def detect_qk_norm(model_path: Path) -> bool:
+    """
+    True iff the checkpoint has Qwen3-style per-head QK-norm, i.e. it contains
+    `self_attn.q_norm` weights. Reads only the safetensors header/index, so it
+    is cheap and independent of the installed transformers version.
+    """
+    index = model_path / "model.safetensors.index.json"
+    if index.exists():
+        with open(index) as f:
+            weight_map = json.load(f)["weight_map"]
+        return any("self_attn.q_norm.weight" in k for k in weight_map)
+
+    single = model_path / "model.safetensors"
+    if single.exists():
+        with safe_open(single, framework="pt") as f:
+            return any("self_attn.q_norm.weight" in k for k in f.keys())
+
+    return False

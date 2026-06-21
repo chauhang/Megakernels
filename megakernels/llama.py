@@ -20,6 +20,7 @@ from megakernels.model_types import (
     ExtraModelConfig,
 )
 from megakernels.utils import (
+    detect_qk_norm,
     load_safetensors_repo,
 )
 
@@ -27,13 +28,16 @@ KV_Cache = tuple[Tensor, Tensor]
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, dim: int | None = None):
         """
-        Taken from LlamaRMSNorm.
+        Taken from LlamaRMSNorm. `dim` defaults to hidden_size; pass head_dim
+        for the Qwen3 per-head q_norm/k_norm.
         """
         super().__init__()
         self.config = config
-        self.weight = nn.Parameter(torch.ones(config.hidden_size))
+        self.weight = nn.Parameter(
+            torch.ones(dim if dim is not None else config.hidden_size)
+        )
 
     def forward(self, hidden_states: Tensor):
         input_dtype = hidden_states.dtype
@@ -190,7 +194,12 @@ class LlamaAttention(nn.Module):
         self.tp_size = extra_config.tp_size or 1
 
         assert config.num_attention_heads % self.tp_size == 0
-        head_dim = config.hidden_size // config.num_attention_heads
+        # Qwen3 sets head_dim explicitly (it is not hidden_size // num_heads for
+        # e.g. Qwen3-4B); fall back to the Llama relation when absent.
+        head_dim = (
+            getattr(config, "head_dim", None)
+            or config.hidden_size // config.num_attention_heads
+        )
         self.head_dim = head_dim
 
         assert self.config.num_attention_heads % self.tp_size == 0
@@ -227,6 +236,13 @@ class LlamaAttention(nn.Module):
             bias=False,
         )
 
+        # Qwen3 applies an RMSNorm over each head's head_dim to Q and K (after
+        # the projection, before RoPE). Llama has neither.
+        self.qk_norm = extra_config.qk_norm
+        if self.qk_norm:
+            self.q_norm = RMSNorm(config, dim=head_dim)
+            self.k_norm = RMSNorm(config, dim=head_dim)
+
         self.kv_cache: KV_Cache | None = None
 
     def forward(
@@ -254,6 +270,11 @@ class LlamaAttention(nn.Module):
         query_states = query_states.view(bsz, seq_len, self.num_attention_heads, -1)
         key_states = key_states.view(bsz, seq_len, self.num_kv_heads, -1)
         value_states = value_states.view(bsz, seq_len, self.num_kv_heads, -1)
+
+        # Qwen3 per-head QK-norm: RMSNorm over the last (head_dim) axis.
+        if self.qk_norm:
+            query_states = self.q_norm(query_states)
+            key_states = self.k_norm(key_states)
 
         cos, sin = batch_state.position_embeddings
 
@@ -473,6 +494,11 @@ class LlamaModel(nn.Module):
             if isinstance(mod, LlamaAttention):
                 mod.q_proj.weight[:] = mod.q_proj.weight[indices_for_q]
                 mod.k_proj.weight[:] = mod.k_proj.weight[indices_for_k]
+                # q_norm/k_norm scale Q/K per head_dim position, so the weights
+                # must be reordered to match the interleaved q/k layout.
+                if mod.qk_norm:
+                    mod.q_norm.weight[:] = mod.q_norm.weight[one_head_indices]
+                    mod.k_norm.weight[:] = mod.k_norm.weight[one_head_indices]
 
     def forward(self, batch_state: BatchState):
         out: BatchState = self.embed_tokens(batch_state)
@@ -496,6 +522,9 @@ class StackedParams:
     up_proj: Tensor
     gate_proj: Tensor
     down_proj: Tensor
+    # Qwen3 per-head q_norm/k_norm, stacked over layers (None for Llama).
+    q_norm: Tensor | None = None
+    k_norm: Tensor | None = None
 
 
 class LlamaForCausalLM(nn.Module):
@@ -598,14 +627,6 @@ class LlamaForCausalLM(nn.Module):
         if dtype is None:
             dtype = config.torch_dtype
 
-        with init_empty_weights(include_buffers=False):
-            model = cls(
-                config,
-                extra_config,
-            )
-        model.dtype = dtype
-        model.device = device
-
         if (as_path := Path(model_name_or_path)).exists():
             model_path = as_path
         else:
@@ -615,6 +636,20 @@ class LlamaForCausalLM(nn.Module):
             )
 
             model_path = Path(snapshot_path_str)
+
+        # Auto-detect Qwen3-style per-head QK-norm from the checkpoint unless the
+        # caller forced it. Must happen before constructing the model so the
+        # q_norm/k_norm submodules exist and are loaded strictly.
+        if extra_config.qk_norm is None:
+            extra_config.qk_norm = detect_qk_norm(model_path)
+
+        with init_empty_weights(include_buffers=False):
+            model = cls(
+                config,
+                extra_config,
+            )
+        model.dtype = dtype
+        model.device = device
 
         model.load_from_safetensors(model_path)
 
@@ -732,6 +767,15 @@ class LlamaForCausalLM(nn.Module):
 
         stacked_o_proj = stack_and_reassign(o_projs, "weight")
         stacked_self_attn_ln_weights = stack_and_reassign(self_attn_lns, "weight")
+
+        stacked_q_norm = stacked_k_norm = None
+        if self.extra_config.qk_norm:
+            stacked_q_norm = stack_and_reassign(
+                [x.q_norm for x in self_attns], "weight"
+            )
+            stacked_k_norm = stack_and_reassign(
+                [x.k_norm for x in self_attns], "weight"
+            )
         stacked_mlp_ln_weights = stack_and_reassign(mlp_lns, "weight")
         stacked_up_proj = stack_and_reassign(up_projs, "weight")
         stacked_gate_proj = stack_and_reassign(gate_projs, "weight")
@@ -774,4 +818,6 @@ class LlamaForCausalLM(nn.Module):
             up_proj=stacked_up_proj,
             gate_proj=stacked_gate_proj,
             down_proj=stacked_down_proj,
+            q_norm=stacked_q_norm,
+            k_norm=stacked_k_norm,
         )

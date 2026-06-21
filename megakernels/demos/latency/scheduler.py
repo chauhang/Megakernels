@@ -75,10 +75,12 @@ def make_globals(
         v_cache=model.stacked_kv_cache[1],
         rope_cos=model.model.rope_cos,
         rope_sin=model.model.rope_sin,
-        # activation buffers
+        # activation buffers. The attention activation width is
+        # num_attention_heads * head_dim, which equals hidden_size for Llama but
+        # not for e.g. Qwen3-4B (head_dim is set independently).
         hidden_states=make_buffer(config.hidden_size),
-        post_ln_rope_q=make_buffer(config.hidden_size),
-        attn_out=make_buffer(config.hidden_size),
+        post_ln_rope_q=make_buffer(config.num_attention_heads * config.head_dim),
+        attn_out=make_buffer(config.num_attention_heads * config.head_dim),
         attn_out_intermediates=make_buffer(
             [config.num_attention_heads, max_attn_partitions, config.head_dim],
             buffer_dtype=torch.float32,
@@ -106,12 +108,16 @@ def make_globals(
         qkv_block_size=16,
         o_proj_block_size=16,
         lm_head_block_size=16,
-        matvec_reduction_size=2048,
+        # down_proj reduction-column tile: schedule_downproj splits the
+        # intermediate dim into (intermediate // hidden) columns of this size.
+        matvec_reduction_size=config.hidden_size,
         attn_kv_block_size=16,
         attn_reduction_size=4,
         vocab_size=config.vocab_size,
         device=device,
         barriers=barriers,
+        q_norm_weights=stacked_params.q_norm,
+        k_norm_weights=stacked_params.k_norm,
     )
 
 

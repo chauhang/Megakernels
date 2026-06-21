@@ -55,6 +55,11 @@ class ExtraModelConfig:
 
     interleave_rope: bool = False
 
+    # Qwen3-family per-head RMSNorm on Q and K (applied after the QKV proj,
+    # before RoPE). None = auto-detect from the checkpoint in from_pretrained;
+    # True/False forces it. Llama checkpoints have no q_norm/k_norm weights.
+    qk_norm: bool | None = None
+
     max_len_override: int | None = None
 
     max_batch_size: int = 1

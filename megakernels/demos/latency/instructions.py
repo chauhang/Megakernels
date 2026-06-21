@@ -28,6 +28,11 @@ class Globals(BaseGlobals):
     attn_kv_block_size: int
     attn_reduction_size: int
 
+    # Qwen3 per-head QK-norm weights, stacked over layers (None => no QK-norm,
+    # i.e. Llama). Each is [num_layers, head_dim].
+    q_norm_weights: Optional[Tensor] = None
+    k_norm_weights: Optional[Tensor] = None
+
 
 @dataclass
 class LayerNorm_QKV_MatVecRopeAppend(Instruction):
